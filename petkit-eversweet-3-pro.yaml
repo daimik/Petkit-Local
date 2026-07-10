@@ -1,0 +1,457 @@
+# PetKit Eversweet 3 Pro (W5-series) BLE reader — ESP32-C3, single file
+# Connects directly to the fountain over BLE, performs the init handshake
+# (213 -> 73 -> 86), then polls state (210) + battery (66). Read-only.
+#
+# Frame format: FA FC FD | cmd | type | seq | len | 00 | data... | FB
+#
+# NOTE: the init command (73) re-registers the secret. The PetKit phone app
+# will need the fountain POWER-CYCLED before it can control it again.
+# Only one BLE central can be connected at a time.
+
+substitutions:
+  board_name: Petkit Eversweet 3 Pro
+  node_name: petkit-eversweet-3-pro
+  fountain_mac: "XX:XX:XX:XX:XX:XX"  # <-- your fountain's BLE MAC address
+  poll_interval: 120s
+
+esphome:
+  name: petkit-eversweet-3-pro
+  friendly_name: Petkit Eversweet 3 Pro
+
+esp32:
+  board: esp32-c3-devkitm-1
+  framework:
+    type: esp-idf
+
+# Enable logging
+logger:
+  level: DEBUG
+
+# Enable Home Assistant API
+api:
+  encryption:
+    key: !secret api_encryption_key
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+  # Enable fallback hotspot (captive portal) in case wifi connection fails
+  ap:
+    ssid: "Petkit-Eversweet-3-Pro"
+    password: !secret ap_password
+
+captive_portal:
+
+# Web server provides REST API endpoint automatically
+web_server:
+  port: 80
+  version: 3
+  local: true
+
+globals:
+  - id: pk_seq
+    type: int
+    initial_value: "0"
+  - id: pk_dev_id
+    type: std::vector<uint8_t>
+  - id: pk_rx
+    type: std::vector<uint8_t>
+  - id: pk_ready
+    type: bool
+    initial_value: "false"
+  - id: pk_connected
+    type: bool
+    initial_value: "false"
+  - id: pk_power
+    type: int
+    initial_value: "1"
+  - id: pk_mode
+    type: int
+    initial_value: "1"
+
+esp32_ble_tracker:
+  scan_parameters:
+    active: true
+
+ble_client:
+  - mac_address: ${fountain_mac}
+    id: fountain
+    auto_connect: true
+    on_connect:
+      then:
+        - lambda: |-
+            id(pk_connected) = true;
+            id(pk_rx).clear();
+            ESP_LOGI("petkit", "Connected to fountain, starting handshake");
+        - script.execute: pk_init
+    on_disconnect:
+      then:
+        - lambda: |-
+            id(pk_connected) = false;
+            id(pk_ready) = false;
+            ESP_LOGW("petkit", "Fountain disconnected");
+        - binary_sensor.template.publish:
+            id: fountain_online
+            state: OFF
+
+script:
+  # ---- low-level senders ---------------------------------------------------
+  - id: pk_send_213   # get device details (device id + serial)
+    mode: queued
+    then:
+      - ble_client.ble_write:
+          id: fountain
+          service_uuid: 0000aaa0-0000-1000-8000-00805f9b34fb
+          characteristic_uuid: 0000aaa2-0000-1000-8000-00805f9b34fb
+          value: !lambda |-
+            std::vector<uint8_t> f = {0xFA, 0xFC, 0xFD, 213, 0x01,
+                                      (uint8_t) id(pk_seq), 2, 0x00,
+                                      0, 0, 0xFB};
+            id(pk_seq) = (id(pk_seq) + 1) & 0xFF;
+            return f;
+
+  - id: pk_send_73    # init device (device_id + secret)
+    mode: queued
+    then:
+      - ble_client.ble_write:
+          id: fountain
+          service_uuid: 0000aaa0-0000-1000-8000-00805f9b34fb
+          characteristic_uuid: 0000aaa2-0000-1000-8000-00805f9b34fb
+          value: !lambda |-
+            // device_id left-padded to 8 bytes
+            std::vector<uint8_t> id8 = id(pk_dev_id);
+            while (id8.size() < 8) id8.insert(id8.begin(), 0);
+            // secret: reversed device_id; trailing 0,0 -> 13,37; left-pad to 8
+            std::vector<uint8_t> sec(id(pk_dev_id).rbegin(), id(pk_dev_id).rend());
+            if (sec.size() >= 2 && sec[sec.size()-1] == 0 && sec[sec.size()-2] == 0) {
+              sec[sec.size()-2] = 13; sec[sec.size()-1] = 37;
+            }
+            while (sec.size() < 8) sec.insert(sec.begin(), 0);
+            std::vector<uint8_t> f = {0xFA, 0xFC, 0xFD, 73, 0x01,
+                                      (uint8_t) id(pk_seq), 18, 0x00, 0, 0};
+            f.insert(f.end(), id8.begin(), id8.end());
+            f.insert(f.end(), sec.begin(), sec.end());
+            f.push_back(0xFB);
+            id(pk_seq) = (id(pk_seq) + 1) & 0xFF;
+            return f;
+
+  - id: pk_send_86    # sync (secret)
+    mode: queued
+    then:
+      - ble_client.ble_write:
+          id: fountain
+          service_uuid: 0000aaa0-0000-1000-8000-00805f9b34fb
+          characteristic_uuid: 0000aaa2-0000-1000-8000-00805f9b34fb
+          value: !lambda |-
+            std::vector<uint8_t> sec(id(pk_dev_id).rbegin(), id(pk_dev_id).rend());
+            if (sec.size() >= 2 && sec[sec.size()-1] == 0 && sec[sec.size()-2] == 0) {
+              sec[sec.size()-2] = 13; sec[sec.size()-1] = 37;
+            }
+            while (sec.size() < 8) sec.insert(sec.begin(), 0);
+            std::vector<uint8_t> f = {0xFA, 0xFC, 0xFD, 86, 0x01,
+                                      (uint8_t) id(pk_seq), 10, 0x00, 0, 0};
+            f.insert(f.end(), sec.begin(), sec.end());
+            f.push_back(0xFB);
+            id(pk_seq) = (id(pk_seq) + 1) & 0xFF;
+            return f;
+
+  - id: pk_send_200   # firmware version
+    mode: queued
+    then:
+      - ble_client.ble_write:
+          id: fountain
+          service_uuid: 0000aaa0-0000-1000-8000-00805f9b34fb
+          characteristic_uuid: 0000aaa2-0000-1000-8000-00805f9b34fb
+          value: !lambda |-
+            std::vector<uint8_t> f = {0xFA, 0xFC, 0xFD, 200, 0x01,
+                                      (uint8_t) id(pk_seq), 0, 0x00, 0xFB};
+            id(pk_seq) = (id(pk_seq) + 1) & 0xFF;
+            return f;
+
+  - id: pk_send_210   # device state
+    mode: queued
+    then:
+      - ble_client.ble_write:
+          id: fountain
+          service_uuid: 0000aaa0-0000-1000-8000-00805f9b34fb
+          characteristic_uuid: 0000aaa2-0000-1000-8000-00805f9b34fb
+          value: !lambda |-
+            std::vector<uint8_t> f = {0xFA, 0xFC, 0xFD, 210, 0x01,
+                                      (uint8_t) id(pk_seq), 2, 0x00,
+                                      0, 0, 0xFB};
+            id(pk_seq) = (id(pk_seq) + 1) & 0xFF;
+            return f;
+
+  - id: pk_send_66    # battery / voltage
+    mode: queued
+    then:
+      - ble_client.ble_write:
+          id: fountain
+          service_uuid: 0000aaa0-0000-1000-8000-00805f9b34fb
+          characteristic_uuid: 0000aaa2-0000-1000-8000-00805f9b34fb
+          value: !lambda |-
+            std::vector<uint8_t> f = {0xFA, 0xFC, 0xFD, 66, 0x01,
+                                      (uint8_t) id(pk_seq), 2, 0x00,
+                                      0, 0, 0xFB};
+            id(pk_seq) = (id(pk_seq) + 1) & 0xFF;
+            return f;
+
+  - id: pk_send_220   # set power state + mode (pwr: 1 on / 0 pause, mde: 1 normal / 2 smart)
+    mode: queued
+    parameters:
+      pwr: int
+      mde: int
+    then:
+      - ble_client.ble_write:
+          id: fountain
+          service_uuid: 0000aaa0-0000-1000-8000-00805f9b34fb
+          characteristic_uuid: 0000aaa2-0000-1000-8000-00805f9b34fb
+          value: !lambda |-
+            std::vector<uint8_t> f = {0xFA, 0xFC, 0xFD, 220, 0x01,
+                                      (uint8_t) id(pk_seq), 2, 0x00,
+                                      (uint8_t) pwr, (uint8_t) mde, 0xFB};
+            id(pk_seq) = (id(pk_seq) + 1) & 0xFF;
+            return f;
+      - delay: 1500ms
+      - script.execute: pk_poll   # read back to confirm
+
+  # ---- init handshake ------------------------------------------------------
+  - id: pk_init
+    mode: restart
+    then:
+      - delay: 3s                      # let GATT service discovery finish
+      - script.execute: pk_send_213
+      - wait_until:
+          condition:
+            lambda: 'return id(pk_dev_id).size() == 6;'
+          timeout: 10s
+      - if:
+          condition:
+            lambda: 'return id(pk_dev_id).size() != 6;'
+          then:
+            - lambda: 'ESP_LOGE("petkit", "No device ID received (cmd 213) - aborting init");'
+          else:
+            - script.execute: pk_send_73
+            - delay: 2s
+            - script.execute: pk_send_86
+            - delay: 1s
+            - script.execute: pk_send_200
+            - delay: 1s
+            - lambda: |-
+                id(pk_ready) = true;
+                ESP_LOGI("petkit", "Handshake complete, polling enabled");
+            - binary_sensor.template.publish:
+                id: fountain_online
+                state: ON
+            - script.execute: pk_poll
+
+  # ---- polling -------------------------------------------------------------
+  - id: pk_poll
+    mode: restart
+    then:
+      - script.execute: pk_send_210
+      - delay: 1s
+      - script.execute: pk_send_66
+
+interval:
+  - interval: ${poll_interval}
+    then:
+      - if:
+          condition:
+            lambda: 'return id(pk_connected) && id(pk_ready);'
+          then:
+            - script.execute: pk_poll
+
+# ---- notification receiver + frame parser ----------------------------------
+sensor:
+  - platform: ble_client
+    ble_client_id: fountain
+    id: pk_raw_notify
+    internal: true
+    type: characteristic
+    service_uuid: 0000aaa0-0000-1000-8000-00805f9b34fb
+    characteristic_uuid: 0000aaa1-0000-1000-8000-00805f9b34fb
+    notify: true
+    lambda: |-
+      // Accumulate: responses can be split across BLE notifications (MTU)
+      auto &buf = id(pk_rx);
+      buf.insert(buf.end(), x.begin(), x.end());
+
+      while (true) {
+        // resync to frame header FA FC FD
+        while (buf.size() >= 3 &&
+               !(buf[0] == 0xFA && buf[1] == 0xFC && buf[2] == 0xFD))
+          buf.erase(buf.begin());
+        if (buf.size() < 8) break;
+        size_t len = buf[6];
+        size_t total = 8 + len + 1;
+        if (buf.size() < total) break;   // frame incomplete, wait for more
+
+        uint8_t cmd = buf[3];
+        std::vector<uint8_t> d(buf.begin() + 8, buf.begin() + 8 + len);
+        buf.erase(buf.begin(), buf.begin() + total);
+        ESP_LOGD("petkit", "Frame cmd=%d len=%d", cmd, (int) len);
+
+        switch (cmd) {
+          case 213: {  // device identifiers
+            if (d.size() >= 8) {
+              id(pk_dev_id).assign(d.begin() + 2, d.begin() + 8);
+              std::string serial;
+              for (size_t i = 8; i < d.size() && i < 23; i++)
+                serial += (char) d[i];
+              id(fountain_serial).publish_state(serial);
+              ESP_LOGI("petkit", "Device ID acquired, serial=%s", serial.c_str());
+            }
+            break;
+          }
+          case 86: {   // sync
+            if (!d.empty())
+              ESP_LOGI("petkit", "Sync response, initialized=%d", d[0]);
+            break;
+          }
+          case 200: {  // firmware
+            if (d.size() >= 2) {
+              char fw[16];
+              snprintf(fw, sizeof(fw), "%d.%d", d[0], d[1]);
+              id(fountain_firmware).publish_state(fw);
+            }
+            break;
+          }
+          case 66: {   // battery
+            if (d.size() >= 3) {
+              id(fountain_voltage).publish_state(((d[0] << 8) | d[1]) / 1000.0f);
+            }
+            break;
+          }
+          case 210: {  // state
+            if (d.size() >= 12) {
+              id(pk_power) = d[0];
+              id(pk_mode) = (d[1] == 2) ? 2 : 1;
+              id(fountain_power_sw).publish_state(d[0] != 0);
+              id(fountain_mode_sel).publish_state(d[1] == 2 ? "Smart" : "Normal");
+              id(fountain_warn_breakdown).publish_state(d[3] != 0);
+              id(fountain_warn_water).publish_state(d[4] != 0);
+              id(fountain_warn_filter).publish_state(d[5] != 0);
+              uint32_t runtime = ((uint32_t) d[6] << 24) | ((uint32_t) d[7] << 16) |
+                                 ((uint32_t) d[8] << 8) | (uint32_t) d[9];
+              char rt[40];
+              uint32_t days = runtime / 86400;
+              uint32_t hours = (runtime % 86400) / 3600;
+              uint32_t mins = (runtime % 3600) / 60;
+              uint32_t secs = runtime % 60;
+              if (days > 0)
+                snprintf(rt, sizeof(rt), "%ud %uh %um %us", days, hours, mins, secs);
+              else if (hours > 0)
+                snprintf(rt, sizeof(rt), "%uh %um %us", hours, mins, secs);
+              else
+                snprintf(rt, sizeof(rt), "%um %us", mins, secs);
+              id(fountain_pump_runtime_text).publish_state(rt);
+              float filter_used = 100.0f - d[10];
+              id(fountain_filter).publish_state(filter_used);
+              id(fountain_running).publish_state(d[11] != 0);
+            }
+            break;
+          }
+          default:
+            ESP_LOGD("petkit", "Unhandled cmd %d", cmd);
+        }
+      }
+      return NAN;
+
+  # ---- exposed entities ----------------------------------------------------
+  - platform: template
+    id: fountain_voltage
+    name: "Voltage"
+    unit_of_measurement: "V"
+    device_class: voltage
+    state_class: measurement
+    accuracy_decimals: 3
+    update_interval: never
+  - platform: template
+    id: fountain_filter
+    name: "Filter used"
+    unit_of_measurement: "%"
+    icon: mdi:air-filter
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: never
+
+binary_sensor:
+  - platform: template
+    id: fountain_online
+    name: "Online"
+    device_class: connectivity
+  - platform: template
+    id: fountain_warn_water
+    name: "Water missing"
+    device_class: problem
+  - platform: template
+    id: fountain_warn_filter
+    name: "Filter warning"
+    device_class: problem
+  - platform: template
+    id: fountain_warn_breakdown
+    name: "Breakdown warning"
+    device_class: problem
+  - platform: template
+    id: fountain_running
+    name: "Pump running"
+    device_class: running
+    icon: mdi:pump
+
+select:
+  - platform: template
+    id: fountain_mode_sel
+    name: "Mode"
+    icon: mdi:fountain
+    options: ["Normal", "Smart"]
+    optimistic: false
+    set_action:
+      - script.execute:
+          id: pk_send_220
+          pwr: !lambda 'return id(pk_power);'
+          mde: !lambda 'return (x == "Smart") ? 2 : 1;'
+
+switch:
+  - platform: template
+    id: fountain_power_sw
+    name: "Power"
+    icon: mdi:power
+    optimistic: false
+    turn_on_action:
+      - script.execute:
+          id: pk_send_220
+          pwr: !lambda 'return 1;'
+          mde: !lambda 'return id(pk_mode);'
+    turn_off_action:   # equals "Pause" in the PetKit app
+      - script.execute:
+          id: pk_send_220
+          pwr: !lambda 'return 0;'
+          mde: !lambda 'return id(pk_mode);'
+
+text_sensor:
+  - platform: template
+    id: fountain_serial
+    name: "Serial"
+    entity_category: diagnostic
+  - platform: template
+    id: fountain_firmware
+    name: "Firmware"
+    entity_category: diagnostic
+  - platform: template
+    id: fountain_pump_runtime_text
+    name: "Pump runtime"
+    icon: mdi:timer-outline
+
+button:
+  - platform: template
+    name: "Refresh Data"
+    on_press:
+      - script.execute: pk_poll
+  - platform: restart
+    name: "Restart reader"

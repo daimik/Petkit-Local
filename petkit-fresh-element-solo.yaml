@@ -1,0 +1,1260 @@
+substitutions:
+  name: fresh-element-solo
+  friendly_name: Petkit Fresh Element Solo
+  device_description: "Petkit Fresh Element Solo Pet Feeder + Eversweet 3 Pro fountain bridge"
+  default_scoops: "1"
+  min_scoops: "0"
+  max_scoops: "6"
+  name_add_mac_suffix: "false"
+  # --- desiccant ---
+  desiccant_interval_days: "30"
+  # --- fountain ---
+  fountain_mac: "XX:XX:XX:XX:XX:XX"  # <-- your fountain's BLE MAC address
+  fountain_poll_interval: 120s
+
+esphome:
+  name: $name
+  friendly_name: $friendly_name
+  name_add_mac_suffix: $name_add_mac_suffix
+  comment: $device_description
+  on_boot:
+    - light.turn_on:
+        id: led
+        effect: fast_blink
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+
+api:
+  encryption:
+    key: !secret api_encryption_key
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+logger:
+  level: INFO
+  baud_rate: 0
+
+web_server:
+  port: 80
+  version: 3
+  sorting_groups:
+    - id: sg_feeding
+      name: "Feeding"
+      sorting_weight: 10
+    - id: sg_fountain
+      name: "Fountain"
+      sorting_weight: 20
+    - id: sg_settings
+      name: "Settings"
+      sorting_weight: 30
+    - id: sg_diag
+      name: "Diagnostics"
+      sorting_weight: 40
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  # Enable fallback hotspot (captive portal) in case wifi connection fails
+  ap:
+    ssid: "Petkit-Fresh-Element-Solo"
+    password: !secret ap_password
+
+captive_portal:
+
+globals:
+  # --- feeder ---
+  - id: scoops_count
+    type: int
+  - id: max_scoops
+    type: int
+  - id: food_sensor_count
+    type: int
+  - id: last_food_sensor_count
+    type: int
+    initial_value: "0"
+    restore_value: True
+  - id: last_food_scoops_count
+    type: int
+    initial_value: "0"
+    restore_value: True
+  # --- desiccant: epoch timestamp of last replacement (0 = not initialized) ---
+  - id: desiccant_last_reset
+    type: uint32_t
+    initial_value: "0"
+    restore_value: True
+  # --- fountain ---
+  - id: pk_seq
+    type: int
+    initial_value: "0"
+  - id: pk_dev_id
+    type: std::vector<uint8_t>
+  - id: pk_rx
+    type: std::vector<uint8_t>
+  - id: pk_ready
+    type: bool
+    initial_value: "false"
+  - id: pk_connected
+    type: bool
+    initial_value: "false"
+  - id: pk_power
+    type: int
+    initial_value: "1"
+  - id: pk_mode
+    type: int
+    initial_value: "1"
+
+# =============================================================================
+# Time: NTP with fallbacks + Home Assistant as secondary source.
+# All schedule logic reads id(sntp_time) — both sources set the same system
+# clock, so either one makes the schedule work.
+# =============================================================================
+time:
+  - id: sntp_time
+    platform: sntp
+    timezone: Europe/Amsterdam
+    servers:
+      - time.google.com
+      - nl.pool.ntp.org
+      - pool.ntp.org
+    on_time_sync:
+      then:
+        - script.execute: apply_timezone
+        - lambda: |-
+            auto t = id(sntp_time).now();
+            if (t.is_valid()) {
+              char buf[64];
+              snprintf(buf, sizeof(buf), "%02d:%02d:%02d  %02d.%02d.%04d (via NTP)",
+                       t.hour, t.minute, t.second, t.day_of_month, t.month, t.year);
+              id(last_ntp_sync).publish_state(buf);
+              id(time_synced).publish_state(true);
+              ESP_LOGI("time", "Time sync via NTP, received: %s", buf);
+            }
+        - script.execute: validate_schedule
+        - script.execute: check_desiccant
+    on_time:
+      # Hourly low-food check (daytime only)
+      - hours: 7-22
+        minutes: 0
+        seconds: 0
+        then:
+          - lambda: |-
+              id(check_food_level)->execute(/* food_dispensed = */ false, /* play_sound = */ true, /* send_event = */ false);
+      # Hourly desiccant age check
+      - hours: "*"
+        minutes: 0
+        seconds: 0
+        then:
+          - script.execute: check_desiccant
+      # Feeding schedule: check every minute against the schedule text
+      - hours: "*"
+        minutes: "*"
+        seconds: 0
+        then:
+          - lambda: |-
+              auto t = id(sntp_time).now();
+              if (!t.is_valid()) return;
+              char nowbuf[6];
+              snprintf(nowbuf, sizeof(nowbuf), "%02d:%02d", t.hour, t.minute);
+              std::string sched = id(feeding_schedule).state;
+              std::string token;
+              for (size_t i = 0; i <= sched.size(); i++) {
+                char c = (i < sched.size()) ? sched[i] : ',';
+                if (c == ',' || c == ';') {
+                  size_t a = token.find_first_not_of(" \t");
+                  size_t b = token.find_last_not_of(" \t");
+                  if (a != std::string::npos) {
+                    std::string item = token.substr(a, b - a + 1);
+                    size_t eq = item.find('=');
+                    if (eq != std::string::npos) {
+                      std::string when = item.substr(0, eq);
+                      // normalize H:MM -> 0H:MM
+                      if (when.size() == 4 && when[1] == ':') when = "0" + when;
+                      if (when == nowbuf) {
+                        int scoops = atoi(item.c_str() + eq + 1);
+                        if (scoops < 1) scoops = 0;
+                        if (scoops > ${max_scoops}) scoops = ${max_scoops};
+                        if (scoops > 0) {
+                          ESP_LOGI("schedule", "Scheduled feeding at %s: %d scoops", nowbuf, scoops);
+                          id(actuate_feeder)->execute(scoops);
+                        }
+                      }
+                    }
+                  }
+                  token.clear();
+                } else {
+                  token += c;
+                }
+              }
+          # refresh "next feeding" display
+          - script.execute: validate_schedule
+
+  # Secondary time source: Home Assistant over the local API.
+  # Covers the "reboot while internet is down but HA is up" case.
+  - id: ha_time
+    platform: homeassistant
+    on_time_sync:
+      then:
+        - script.execute: apply_timezone
+        - lambda: |-
+            auto t = id(sntp_time).now();
+            if (t.is_valid()) {
+              char buf[64];
+              snprintf(buf, sizeof(buf), "%02d:%02d:%02d  %02d.%02d.%04d (via Home Assistant)",
+                       t.hour, t.minute, t.second, t.day_of_month, t.month, t.year);
+              id(last_ntp_sync).publish_state(buf);
+              id(time_synced).publish_state(true);
+              ESP_LOGI("time", "Time sync via Home Assistant: %s", buf);
+            }
+        - script.execute: validate_schedule
+        - script.execute: check_desiccant
+
+# =============================================================================
+# BLE client for the fountain — PASSIVE scan (brownout fix)
+# =============================================================================
+esp32_ble_tracker:
+  scan_parameters:
+    active: false
+
+ble_client:
+  - mac_address: ${fountain_mac}
+    id: fountain
+    auto_connect: true
+    on_connect:
+      then:
+        - lambda: |-
+            id(pk_connected) = true;
+            id(pk_rx).clear();
+            ESP_LOGI("petkit", "Connected to fountain, starting handshake");
+        - script.execute: pk_init
+    on_disconnect:
+      then:
+        - lambda: |-
+            id(pk_connected) = false;
+            id(pk_ready) = false;
+            ESP_LOGW("petkit", "Fountain disconnected");
+        - binary_sensor.template.publish:
+            id: fountain_online
+            state: OFF
+
+script:
+  # ===========================================================================
+  # Timezone: map IANA-style name from select -> POSIX TZ string (runtime)
+  # ===========================================================================
+  - id: apply_timezone
+    then:
+      - lambda: |-
+          std::string tz = id(tz_select).current_option();
+          std::string posix = "CET-1CEST,M3.5.0,M10.5.0/3";  // Europe/Amsterdam default
+          if (tz == "Europe/Amsterdam" || tz == "Europe/Berlin" || tz == "Europe/Paris") {
+            posix = "CET-1CEST,M3.5.0,M10.5.0/3";
+          } else if (tz == "Europe/London") {
+            posix = "GMT0BST,M3.5.0/1,M10.5.0";
+          } else if (tz == "Europe/Lisbon") {
+            posix = "WET0WEST,M3.5.0/1,M10.5.0";
+          } else if (tz == "Europe/Riga" || tz == "Europe/Helsinki") {
+            posix = "EET-2EEST,M3.5.0/3,M10.5.0/4";
+          } else if (tz == "UTC") {
+            posix = "UTC0";
+          }
+          id(sntp_time).set_timezone(posix);
+          ESP_LOGI("time", "Timezone set to %s (%s)", tz.c_str(), posix.c_str());
+
+  # ===========================================================================
+  # Desiccant tracking: compares now() against the stored replacement epoch.
+  # Publishes days left; raises "Feeder Desiccant warning" when overdue and
+  # fires esphome.feeder_desiccant_due once on the transition.
+  # ===========================================================================
+  - id: check_desiccant
+    then:
+      - lambda: |-
+          auto t = id(sntp_time).now();
+          if (!t.is_valid()) return;
+          uint32_t now_ts = t.timestamp;
+          if (id(desiccant_last_reset) == 0 || id(desiccant_last_reset) > now_ts) {
+            // first run after flash (or corrupted value): start counting now
+            id(desiccant_last_reset) = now_ts;
+            ESP_LOGI("desiccant", "Desiccant counter initialized");
+          }
+          float days_used = (now_ts - id(desiccant_last_reset)) / 86400.0f;
+          float days_left = ${desiccant_interval_days} - days_used;
+          if (days_left < 0) days_left = 0;
+          id(desiccant_days_left).publish_state(floorf(days_left));
+          bool overdue = days_used >= ${desiccant_interval_days};
+          if (overdue && !id(feeder_desiccant_warn).state) {
+            ESP_LOGW("desiccant", "Desiccant is due for replacement (%.1f days old)", days_used);
+            id(dispatch_feeder_desiccant_event)->execute("${friendly_name} desiccant is due for replacement.");
+          }
+          id(feeder_desiccant_warn).publish_state(overdue);
+
+  - id: dispatch_feeder_desiccant_event
+    parameters:
+      event_message: string
+    then:
+      - homeassistant.event:
+          event: esphome.feeder_desiccant_due
+          data:
+            message: !lambda return event_message;
+
+  # ===========================================================================
+  # Schedule validation: parses the schedule text strictly, reports errors,
+  # counts feedings, and shows the next planned feeding.
+  # ===========================================================================
+  - id: validate_schedule
+    then:
+      - lambda: |-
+          std::string sched = id(feeding_schedule).state;
+          int valid = 0;
+          std::string bad = "";
+          auto t = id(sntp_time).now();
+          int now_min = t.is_valid() ? (t.hour * 60 + t.minute) : -1;
+          int best = -1, best_scoops = 0, best_delta = 100000;
+          std::string token;
+          for (size_t i = 0; i <= sched.size(); i++) {
+            char c = (i < sched.size()) ? sched[i] : ',';
+            if (c == ',' || c == ';') {
+              size_t a = token.find_first_not_of(" \t");
+              size_t b = token.find_last_not_of(" \t");
+              if (a != std::string::npos) {
+                std::string item = token.substr(a, b - a + 1);
+                bool ok = false;
+                size_t eq = item.find('=');
+                if (eq != std::string::npos) {
+                  std::string when = item.substr(0, eq);
+                  // trim trailing spaces of time part
+                  size_t we = when.find_last_not_of(" \t");
+                  if (we != std::string::npos) when = when.substr(0, we + 1);
+                  if (when.size() == 4 && when[1] == ':') when = "0" + when;
+                  if (when.size() == 5 && when[2] == ':' &&
+                      isdigit((unsigned char) when[0]) && isdigit((unsigned char) when[1]) &&
+                      isdigit((unsigned char) when[3]) && isdigit((unsigned char) when[4])) {
+                    int hh = (when[0] - '0') * 10 + (when[1] - '0');
+                    int mm = (when[3] - '0') * 10 + (when[4] - '0');
+                    int scoops = atoi(item.c_str() + eq + 1);
+                    if (hh < 24 && mm < 60 && scoops >= 1 && scoops <= ${max_scoops}) {
+                      ok = true;
+                      valid++;
+                      if (now_min >= 0) {
+                        int m = hh * 60 + mm;
+                        int delta = m - now_min;
+                        if (delta <= 0) delta += 1440;
+                        if (delta < best_delta) {
+                          best_delta = delta; best = m; best_scoops = scoops;
+                        }
+                      }
+                    }
+                  }
+                }
+                if (!ok) {
+                  if (!bad.empty()) bad += ", ";
+                  bad += "'" + item + "'";
+                }
+              }
+              token.clear();
+            } else {
+              token += c;
+            }
+          }
+          char out[100];
+          if (!bad.empty()) {
+            snprintf(out, sizeof(out), "ERROR, not applied: %s", bad.c_str());
+          } else if (valid == 0) {
+            snprintf(out, sizeof(out), "Applied: no feedings scheduled");
+          } else if (best >= 0) {
+            snprintf(out, sizeof(out), "Applied: %d/day, next %02d:%02d (%d %s)",
+                     valid, best / 60, best % 60, best_scoops,
+                     best_scoops == 1 ? "serving" : "servings");
+          } else {
+            snprintf(out, sizeof(out), "Applied: %d feedings/day (waiting for time sync)", valid);
+          }
+          id(schedule_status).publish_state(out);
+          ESP_LOGI("schedule", "%s", out);
+
+  # ===========================================================================
+  # Feeder scripts
+  # ===========================================================================
+  - id: play_rtttl
+    parameters:
+      song_str: string
+    then:
+      - if:
+          condition:
+            lambda: return !(id(mute_sounds).state);
+          then:
+            - rtttl.play:
+                rtttl: !lambda "return song_str;"
+  - id: actuate_feeder
+    parameters:
+      scoops: int
+    then:
+      - if:
+          condition:
+            lambda: return scoops > 0;
+          then:
+            - logger.log:
+                level: INFO
+                format: "Serving %d scoops"
+                args: [scoops]
+            - lambda: |-
+                id(play_rtttl)->execute("two_shorts:d=4,o=5,b=100:16e6,16e6");
+                id(scoops_count) = 0;
+                id(food_sensor_count) = 0;
+                id(max_scoops) = scoops;
+            - switch.turn_on: feed_forward
+  - id: dispatch_feeder_food_dispensed_event
+    parameters:
+      event_message: string
+    then:
+      - homeassistant.event:
+          event: esphome.feeder_food_dispensed
+          data:
+            message: !lambda return event_message;
+  - id: dispatch_feeder_food_low_event
+    parameters:
+      event_message: string
+    then:
+      - homeassistant.event:
+          event: esphome.feeder_food_low
+          data:
+            message: !lambda return event_message;
+  - id: check_food_level
+    parameters:
+      food_dispensed: bool
+      play_sound: bool
+      send_event: bool
+    then:
+      lambda: |-
+        if (id(last_food_scoops_count) > 0 && id(last_food_sensor_count) / id(last_food_scoops_count) < id(low_food_threshold).state) {
+          if (play_sound) {
+            id(play_rtttl)->execute("siren:d=8,o=5,b=100:d,e,d,e,d,e,d,e");
+          }
+          if (send_event) {
+            id(dispatch_feeder_food_low_event)->execute("${friendly_name} food level is low. Check the hopper.");
+          }
+          id(feeder_state).publish_state("Food level is low");
+          ESP_LOGI("main", "Food level is low");
+        } else if (food_dispensed) {
+          id(feeder_state).publish_state("Food dispensed");
+          auto t = id(sntp_time).now();
+          if (t.is_valid()) {
+            char lf[48];
+            snprintf(lf, sizeof(lf), "%d serving(s) at %02d:%02d",
+                     id(last_food_scoops_count), t.hour, t.minute);
+            id(last_feeding).publish_state(lf);
+          }
+          id(play_rtttl)->execute("one_short:d=4,o=5,b=100:16e6");
+          if (id(last_food_scoops_count) == 1) {
+            id(dispatch_feeder_food_dispensed_event)->execute("${friendly_name} dispensed 1 serving of food.");
+          } else {
+            id(dispatch_feeder_food_dispensed_event)->execute("${friendly_name} dispensed " + to_string(id(scoops_count)) + " servings of food.");
+          }
+        }
+
+  # ===========================================================================
+  # Fountain scripts (BLE frame senders)
+  # Frame format: FA FC FD | cmd | type | seq | len | 00 | data... | FB
+  # ===========================================================================
+  - id: pk_send_213   # get device details (device id + serial)
+    mode: queued
+    then:
+      - ble_client.ble_write:
+          id: fountain
+          service_uuid: 0000aaa0-0000-1000-8000-00805f9b34fb
+          characteristic_uuid: 0000aaa2-0000-1000-8000-00805f9b34fb
+          value: !lambda |-
+            std::vector<uint8_t> f = {0xFA, 0xFC, 0xFD, 213, 0x01,
+                                      (uint8_t) id(pk_seq), 2, 0x00,
+                                      0, 0, 0xFB};
+            id(pk_seq) = (id(pk_seq) + 1) & 0xFF;
+            return f;
+
+  - id: pk_send_73    # init device (device_id + secret)
+    mode: queued
+    then:
+      - ble_client.ble_write:
+          id: fountain
+          service_uuid: 0000aaa0-0000-1000-8000-00805f9b34fb
+          characteristic_uuid: 0000aaa2-0000-1000-8000-00805f9b34fb
+          value: !lambda |-
+            // device_id left-padded to 8 bytes
+            std::vector<uint8_t> id8 = id(pk_dev_id);
+            while (id8.size() < 8) id8.insert(id8.begin(), 0);
+            // secret: reversed device_id; trailing 0,0 -> 13,37; left-pad to 8
+            std::vector<uint8_t> sec(id(pk_dev_id).rbegin(), id(pk_dev_id).rend());
+            if (sec.size() >= 2 && sec[sec.size()-1] == 0 && sec[sec.size()-2] == 0) {
+              sec[sec.size()-2] = 13; sec[sec.size()-1] = 37;
+            }
+            while (sec.size() < 8) sec.insert(sec.begin(), 0);
+            std::vector<uint8_t> f = {0xFA, 0xFC, 0xFD, 73, 0x01,
+                                      (uint8_t) id(pk_seq), 18, 0x00, 0, 0};
+            f.insert(f.end(), id8.begin(), id8.end());
+            f.insert(f.end(), sec.begin(), sec.end());
+            f.push_back(0xFB);
+            id(pk_seq) = (id(pk_seq) + 1) & 0xFF;
+            return f;
+
+  - id: pk_send_86    # sync (secret)
+    mode: queued
+    then:
+      - ble_client.ble_write:
+          id: fountain
+          service_uuid: 0000aaa0-0000-1000-8000-00805f9b34fb
+          characteristic_uuid: 0000aaa2-0000-1000-8000-00805f9b34fb
+          value: !lambda |-
+            std::vector<uint8_t> sec(id(pk_dev_id).rbegin(), id(pk_dev_id).rend());
+            if (sec.size() >= 2 && sec[sec.size()-1] == 0 && sec[sec.size()-2] == 0) {
+              sec[sec.size()-2] = 13; sec[sec.size()-1] = 37;
+            }
+            while (sec.size() < 8) sec.insert(sec.begin(), 0);
+            std::vector<uint8_t> f = {0xFA, 0xFC, 0xFD, 86, 0x01,
+                                      (uint8_t) id(pk_seq), 10, 0x00, 0, 0};
+            f.insert(f.end(), sec.begin(), sec.end());
+            f.push_back(0xFB);
+            id(pk_seq) = (id(pk_seq) + 1) & 0xFF;
+            return f;
+
+  - id: pk_send_200   # firmware version
+    mode: queued
+    then:
+      - ble_client.ble_write:
+          id: fountain
+          service_uuid: 0000aaa0-0000-1000-8000-00805f9b34fb
+          characteristic_uuid: 0000aaa2-0000-1000-8000-00805f9b34fb
+          value: !lambda |-
+            std::vector<uint8_t> f = {0xFA, 0xFC, 0xFD, 200, 0x01,
+                                      (uint8_t) id(pk_seq), 0, 0x00, 0xFB};
+            id(pk_seq) = (id(pk_seq) + 1) & 0xFF;
+            return f;
+
+  - id: pk_send_210   # device state
+    mode: queued
+    then:
+      - ble_client.ble_write:
+          id: fountain
+          service_uuid: 0000aaa0-0000-1000-8000-00805f9b34fb
+          characteristic_uuid: 0000aaa2-0000-1000-8000-00805f9b34fb
+          value: !lambda |-
+            std::vector<uint8_t> f = {0xFA, 0xFC, 0xFD, 210, 0x01,
+                                      (uint8_t) id(pk_seq), 2, 0x00,
+                                      0, 0, 0xFB};
+            id(pk_seq) = (id(pk_seq) + 1) & 0xFF;
+            return f;
+
+  - id: pk_send_66    # battery / voltage
+    mode: queued
+    then:
+      - ble_client.ble_write:
+          id: fountain
+          service_uuid: 0000aaa0-0000-1000-8000-00805f9b34fb
+          characteristic_uuid: 0000aaa2-0000-1000-8000-00805f9b34fb
+          value: !lambda |-
+            std::vector<uint8_t> f = {0xFA, 0xFC, 0xFD, 66, 0x01,
+                                      (uint8_t) id(pk_seq), 2, 0x00,
+                                      0, 0, 0xFB};
+            id(pk_seq) = (id(pk_seq) + 1) & 0xFF;
+            return f;
+
+  - id: pk_send_220   # set power state + mode (pwr: 1 on / 0 pause, mde: 1 normal / 2 smart)
+    mode: queued
+    parameters:
+      pwr: int
+      mde: int
+    then:
+      - ble_client.ble_write:
+          id: fountain
+          service_uuid: 0000aaa0-0000-1000-8000-00805f9b34fb
+          characteristic_uuid: 0000aaa2-0000-1000-8000-00805f9b34fb
+          value: !lambda |-
+            std::vector<uint8_t> f = {0xFA, 0xFC, 0xFD, 220, 0x01,
+                                      (uint8_t) id(pk_seq), 2, 0x00,
+                                      (uint8_t) pwr, (uint8_t) mde, 0xFB};
+            id(pk_seq) = (id(pk_seq) + 1) & 0xFF;
+            return f;
+      - delay: 1500ms
+      - script.execute: pk_poll   # read back to confirm
+
+  - id: pk_send_222   # reset filter counter (data byte 0 = reset)
+    mode: queued
+    then:
+      - ble_client.ble_write:
+          id: fountain
+          service_uuid: 0000aaa0-0000-1000-8000-00805f9b34fb
+          characteristic_uuid: 0000aaa2-0000-1000-8000-00805f9b34fb
+          value: !lambda |-
+            std::vector<uint8_t> f = {0xFA, 0xFC, 0xFD, 222, 0x01,
+                                      (uint8_t) id(pk_seq), 1, 0x00,
+                                      0, 0xFB};
+            id(pk_seq) = (id(pk_seq) + 1) & 0xFF;
+            return f;
+      - delay: 1500ms
+      - script.execute: pk_poll   # read back: filter should return to 100%
+
+  # ---- fountain init handshake ----------------------------------------------
+  - id: pk_init
+    mode: restart
+    then:
+      - delay: 3s                      # let GATT service discovery finish
+      - script.execute: pk_send_213
+      - wait_until:
+          condition:
+            lambda: 'return id(pk_dev_id).size() == 6;'
+          timeout: 10s
+      - if:
+          condition:
+            lambda: 'return id(pk_dev_id).size() != 6;'
+          then:
+            - lambda: 'ESP_LOGE("petkit", "No device ID received (cmd 213) - aborting init");'
+          else:
+            - script.execute: pk_send_73
+            - delay: 2s
+            - script.execute: pk_send_86
+            - delay: 1s
+            - script.execute: pk_send_200
+            - delay: 1s
+            - lambda: |-
+                id(pk_ready) = true;
+                ESP_LOGI("petkit", "Handshake complete, polling enabled");
+            - binary_sensor.template.publish:
+                id: fountain_online
+                state: ON
+            - script.execute: pk_poll
+
+  # ---- fountain polling -------------------------------------------------------
+  - id: pk_poll
+    mode: restart
+    then:
+      - script.execute: pk_send_210
+      - delay: 1s
+      - script.execute: pk_send_66
+
+light:
+  - platform: binary
+    id: led
+    output: led_output
+    effects:
+      - strobe:
+          name: fast_blink
+          colors:
+            - state: True
+              duration: 125ms
+            - state: False
+              duration: 125ms
+    internal: True
+
+output:
+  - id: led_output
+    platform: gpio
+    pin: GPIO5
+  - platform: ledc
+    pin: GPIO16
+    id: rtttl_output
+
+rtttl:
+  output: rtttl_output
+
+interval:
+  # Feeder: LED WiFi status
+  - interval: 1s
+    then:
+      if:
+        condition:
+          wifi.connected:
+        then:
+          - light.turn_on:
+              id: led
+              effect: None
+        else:
+          - light.turn_on:
+              id: led
+              effect: fast_blink
+  # Fountain: periodic poll
+  - interval: ${fountain_poll_interval}
+    then:
+      - if:
+          condition:
+            lambda: 'return id(pk_connected) && id(pk_ready);'
+          then:
+            - script.execute: pk_poll
+
+uart:
+  tx_pin: GPIO1
+  rx_pin: GPIO3
+  baud_rate: 9600
+
+# =============================================================================
+# Feeding schedule as ONE text field. Format: HH:MM=scoops, comma-separated.
+# Example: 07:00=2, 12:30=1, 18:00=2
+# =============================================================================
+text:
+  - platform: template
+    id: feeding_schedule
+    name: "Feeding schedule"
+    icon: mdi:calendar-clock
+    optimistic: true
+    restore_value: true
+    initial_value: "07:00=1, 18:00=1"
+    min_length: 0
+    max_length: 255
+    mode: text
+    on_value:
+      - script.execute: validate_schedule
+    web_server:
+      sorting_group_id: sg_feeding
+      sorting_weight: 20
+
+number:
+  - platform: template
+    id: default_scoops
+    name: "Manual dispense scoops"
+    icon: mdi:cup
+    entity_category: config
+    min_value: 1
+    max_value: $max_scoops
+    initial_value: 1
+    optimistic: true
+    step: 1
+    restore_value: true
+    unit_of_measurement: srv
+    mode: slider
+    web_server:
+      sorting_group_id: sg_feeding
+      sorting_weight: 15
+  - platform: template
+    id: low_food_threshold
+    # Minimum food quantity per scoop (specific to a particular dry food).
+    name: "Low food threshold"
+    icon: mdi:cup-outline
+    entity_category: config
+    min_value: 1
+    max_value: 10
+    initial_value: 5
+    optimistic: true
+    step: 1
+    restore_value: true
+    mode: slider
+    web_server:
+      sorting_group_id: sg_settings
+      sorting_weight: 20
+
+select:
+  # --- timezone (runtime) ---
+  - platform: template
+    id: tz_select
+    name: "Timezone"
+    icon: mdi:map-clock
+    entity_category: config
+    options:
+      - "Europe/Amsterdam"
+      - "Europe/Berlin"
+      - "Europe/Paris"
+      - "Europe/London"
+      - "Europe/Lisbon"
+      - "Europe/Riga"
+      - "Europe/Helsinki"
+      - "UTC"
+    initial_option: "Europe/Amsterdam"
+    optimistic: true
+    restore_value: true
+    set_action:
+      - script.execute: apply_timezone
+    web_server:
+      sorting_group_id: sg_settings
+      sorting_weight: 10
+  # --- fountain mode ---
+  - platform: template
+    id: fountain_mode_sel
+    name: "Fountain Mode"
+    icon: mdi:fountain
+    options: ["Normal", "Smart"]
+    optimistic: false
+    set_action:
+      - script.execute:
+          id: pk_send_220
+          pwr: !lambda 'return id(pk_power);'
+          mde: !lambda 'return (x == "Smart") ? 2 : 1;'
+    web_server:
+      sorting_group_id: sg_fountain
+      sorting_weight: 20
+
+binary_sensor:
+  # --- feeder ---
+  - id: manual_feed_button
+    internal: true
+    platform: gpio
+    pin:
+      number: GPIO34
+      inverted: true
+    on_press:
+      then:
+        - lambda: id(actuate_feeder)->execute((int) id(default_scoops).state);
+  - id: motor_sensor
+    internal: true
+    platform: gpio
+    pin:
+      number: GPIO27
+      inverted: true
+    on_press:
+      then:
+        - lambda: |-
+            id(scoops_count) += 1;
+            if (id(scoops_count) >= id(max_scoops)) {
+              id(feed_forward).turn_off();
+              id(last_food_sensor_count) = id(food_sensor_count);
+              id(last_food_scoops_count) = id(scoops_count);
+              id(check_food_level)->execute(/* food_dispensed = */ true, /* play_sound = */ true, /* send_event = */ true);
+            }
+        - logger.log:
+            level: INFO
+            format: "%d/%d scoops served"
+            args: [id(scoops_count), id(max_scoops)]
+  - id: feed_sensor
+    internal: true
+    platform: gpio
+    pin:
+      number: GPIO14
+    on_press:
+      then:
+        - lambda: |-
+            id(food_sensor_count) += 1;
+  # --- desiccant ---
+  - platform: template
+    id: feeder_desiccant_warn
+    name: "Feeder Desiccant warning"
+    device_class: problem
+    icon: mdi:water-percent-alert
+    web_server:
+      sorting_group_id: sg_feeding
+      sorting_weight: 35
+  # --- time ---
+  - platform: template
+    id: time_synced
+    name: "Time synchronized"
+    device_class: connectivity
+    icon: mdi:clock-check-outline
+    web_server:
+      sorting_group_id: sg_settings
+      sorting_weight: 16
+  # --- fountain ---
+  - platform: template
+    id: fountain_online
+    name: "Fountain Online"
+    device_class: connectivity
+    web_server:
+      sorting_group_id: sg_fountain
+      sorting_weight: 30
+  - platform: template
+    id: fountain_warn_water
+    name: "Fountain Water missing"
+    device_class: problem
+    web_server:
+      sorting_group_id: sg_fountain
+      sorting_weight: 40
+  - platform: template
+    id: fountain_warn_filter
+    name: "Fountain Filter warning"
+    device_class: problem
+    web_server:
+      sorting_group_id: sg_fountain
+      sorting_weight: 50
+  - platform: template
+    id: fountain_warn_breakdown
+    name: "Fountain Breakdown warning"
+    device_class: problem
+    web_server:
+      sorting_group_id: sg_fountain
+      sorting_weight: 60
+  - platform: template
+    id: fountain_running
+    name: "Fountain Pump running"
+    device_class: running
+    icon: mdi:pump
+    web_server:
+      sorting_group_id: sg_fountain
+      sorting_weight: 35
+
+text_sensor:
+  # --- feeder ---
+  - platform: template
+    name: "Feeder status"
+    id: feeder_state
+    icon: mdi:information-outline
+    entity_category: diagnostic
+    web_server:
+      sorting_group_id: sg_diag
+      sorting_weight: 10
+  # --- last feeding (unique state on every dispense) ---
+  - platform: template
+    id: last_feeding
+    name: "Last feeding"
+    icon: mdi:silverware-fork-knife
+    web_server:
+      sorting_group_id: sg_feeding
+      sorting_weight: 32
+      # --- schedule status (result of validation / next feeding) ---
+  - platform: template
+    id: schedule_status
+    name: "Schedule status"
+    icon: mdi:calendar-check
+    web_server:
+      sorting_group_id: sg_feeding
+      sorting_weight: 30
+  # --- live feeder clock ---
+  - platform: template
+    id: feeder_time
+    name: "Feeder time"
+    icon: mdi:clock-outline
+    entity_category: diagnostic
+    update_interval: 1s
+    lambda: |-
+      auto t = id(sntp_time).now();
+      if (!t.is_valid()) return std::string("waiting for time sync...");
+      char buf[48];
+      snprintf(buf, sizeof(buf), "%02d:%02d:%02d  %02d.%02d.%04d",
+               t.hour, t.minute, t.second, t.day_of_month, t.month, t.year);
+      return std::string(buf);
+    web_server:
+      sorting_group_id: sg_settings
+      sorting_weight: 15
+  # --- last time sync (time received + source) ---
+  - platform: template
+    id: last_ntp_sync
+    name: "Last time sync"
+    icon: mdi:clock-check-outline
+    entity_category: diagnostic
+    web_server:
+      sorting_group_id: sg_settings
+      sorting_weight: 17
+  # --- fountain ---
+  - platform: template
+    id: fountain_serial
+    name: "Fountain Serial"
+    entity_category: diagnostic
+    web_server:
+      sorting_group_id: sg_diag
+      sorting_weight: 40
+  - platform: template
+    id: fountain_firmware
+    name: "Fountain Firmware"
+    entity_category: diagnostic
+    web_server:
+      sorting_group_id: sg_diag
+      sorting_weight: 50
+  - platform: template
+    id: fountain_pump_runtime_text
+    name: "Fountain Pump runtime"
+    icon: mdi:timer-outline
+    web_server:
+      sorting_group_id: sg_fountain
+      sorting_weight: 70
+
+switch:
+  # --- feeder ---
+  - id: enable_sensors
+    internal: true
+    platform: gpio
+    pin:
+      number: GPIO33
+    restore_mode: ALWAYS_ON
+    disabled_by_default: true
+  - id: enable_feeder_motor
+    internal: true
+    platform: gpio
+    pin:
+      number: GPIO19
+    restore_mode: ALWAYS_OFF
+    disabled_by_default: true
+  - id: feed_forward
+    internal: true
+    interlock: &interlock_group [feed_forward, feed_reverse]
+    platform: gpio
+    pin:
+      number: GPIO18
+    restore_mode: ALWAYS_OFF
+    on_turn_on:
+      then:
+        - switch.turn_on: enable_feeder_motor
+    on_turn_off:
+      then:
+        - switch.turn_off: enable_feeder_motor
+  - id: feed_reverse
+    internal: true
+    interlock: *interlock_group
+    platform: gpio
+    pin:
+      number: GPIO17
+    restore_mode: ALWAYS_OFF
+  - id: mute_sounds
+    name: Mute sounds
+    icon: mdi:volume-off
+    optimistic: true
+    platform: template
+    web_server:
+      sorting_group_id: sg_settings
+      sorting_weight: 30
+  # --- fountain ---
+  - platform: template
+    id: fountain_power_sw
+    name: "Fountain Power"
+    icon: mdi:power
+    optimistic: false
+    turn_on_action:
+      - script.execute:
+          id: pk_send_220
+          pwr: !lambda 'return 1;'
+          mde: !lambda 'return id(pk_mode);'
+    turn_off_action:   # equals "Pause" in the PetKit app
+      - script.execute:
+          id: pk_send_220
+          pwr: !lambda 'return 0;'
+          mde: !lambda 'return id(pk_mode);'
+    web_server:
+      sorting_group_id: sg_fountain
+      sorting_weight: 10
+
+sensor:
+  # --- feeder ---
+  - platform: wifi_signal
+    name: "Signal"
+    update_interval: 60s
+    web_server:
+      sorting_group_id: sg_diag
+      sorting_weight: 60
+  - platform: template
+    id: dispensed_food_quantity
+    name: "Dispensed food quantity"
+    icon: mdi:cup
+    entity_category: diagnostic
+    state_class: "measurement"
+    accuracy_decimals: 0
+    lambda: |-
+      return id(last_food_sensor_count);
+    web_server:
+      sorting_group_id: sg_diag
+      sorting_weight: 20
+  - platform: template
+    id: dispensed_food_scoops
+    name: "Food Servings Dispensed"
+    icon: mdi:cup
+    entity_category: diagnostic
+    state_class: "measurement"
+    accuracy_decimals: 0
+    lambda: |-
+      return id(last_food_scoops_count);
+    web_server:
+      sorting_group_id: sg_diag
+      sorting_weight: 30
+  # --- desiccant days remaining ---
+  - platform: template
+    id: desiccant_days_left
+    name: "Desiccant days left"
+    icon: mdi:water-percent
+    unit_of_measurement: "d"
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: never
+    web_server:
+      sorting_group_id: sg_feeding
+      sorting_weight: 40
+  # --- fountain: notification receiver + frame parser ---
+  - platform: ble_client
+    ble_client_id: fountain
+    id: pk_raw_notify
+    internal: true
+    type: characteristic
+    service_uuid: 0000aaa0-0000-1000-8000-00805f9b34fb
+    characteristic_uuid: 0000aaa1-0000-1000-8000-00805f9b34fb
+    notify: true
+    lambda: |-
+      // Accumulate: responses can be split across BLE notifications (MTU)
+      auto &buf = id(pk_rx);
+      buf.insert(buf.end(), x.begin(), x.end());
+
+      while (true) {
+        // resync to frame header FA FC FD
+        while (buf.size() >= 3 &&
+               !(buf[0] == 0xFA && buf[1] == 0xFC && buf[2] == 0xFD))
+          buf.erase(buf.begin());
+        if (buf.size() < 8) break;
+        size_t len = buf[6];
+        size_t total = 8 + len + 1;
+        if (buf.size() < total) break;   // frame incomplete, wait for more
+
+        uint8_t cmd = buf[3];
+        std::vector<uint8_t> d(buf.begin() + 8, buf.begin() + 8 + len);
+        buf.erase(buf.begin(), buf.begin() + total);
+        ESP_LOGD("petkit", "Frame cmd=%d len=%d", cmd, (int) len);
+
+        switch (cmd) {
+          case 213: {  // device identifiers
+            if (d.size() >= 8) {
+              id(pk_dev_id).assign(d.begin() + 2, d.begin() + 8);
+              std::string serial;
+              for (size_t i = 8; i < d.size() && i < 23; i++)
+                serial += (char) d[i];
+              id(fountain_serial).publish_state(serial);
+              ESP_LOGI("petkit", "Device ID acquired, serial=%s", serial.c_str());
+            }
+            break;
+          }
+          case 86: {   // sync
+            if (!d.empty())
+              ESP_LOGI("petkit", "Sync response, initialized=%d", d[0]);
+            break;
+          }
+          case 200: {  // firmware
+            if (d.size() >= 2) {
+              char fw[16];
+              snprintf(fw, sizeof(fw), "%d.%d", d[0], d[1]);
+              id(fountain_firmware).publish_state(fw);
+            }
+            break;
+          }
+          case 66: {   // battery
+            if (d.size() >= 3) {
+              id(fountain_voltage).publish_state(((d[0] << 8) | d[1]) / 1000.0f);
+            }
+            break;
+          }
+          case 222: {  // filter reset ack
+            ESP_LOGI("petkit", "Filter reset acknowledged by fountain");
+            break;
+          }
+          case 210: {  // state
+            if (d.size() >= 12) {
+              id(pk_power) = d[0];
+              id(pk_mode) = (d[1] == 2) ? 2 : 1;
+              id(fountain_power_sw).publish_state(d[0] != 0);
+              id(fountain_mode_sel).publish_state(d[1] == 2 ? "Smart" : "Normal");
+              id(fountain_warn_breakdown).publish_state(d[3] != 0);
+              id(fountain_warn_water).publish_state(d[4] != 0);
+              id(fountain_warn_filter).publish_state(d[5] != 0);
+              uint32_t runtime = ((uint32_t) d[6] << 24) | ((uint32_t) d[7] << 16) |
+                                 ((uint32_t) d[8] << 8) | (uint32_t) d[9];
+              char rt[40];
+              uint32_t days = runtime / 86400;
+              uint32_t hours = (runtime % 86400) / 3600;
+              uint32_t mins = (runtime % 3600) / 60;
+              uint32_t secs = runtime % 60;
+              if (days > 0)
+                snprintf(rt, sizeof(rt), "%ud %uh %um %us", days, hours, mins, secs);
+              else if (hours > 0)
+                snprintf(rt, sizeof(rt), "%uh %um %us", hours, mins, secs);
+              else
+                snprintf(rt, sizeof(rt), "%um %us", mins, secs);
+              id(fountain_pump_runtime_text).publish_state(rt);
+              float filter_used = 100.0f - d[10];
+              id(fountain_filter).publish_state(filter_used);
+              id(fountain_running).publish_state(d[11] != 0);
+            }
+            break;
+          }
+          default:
+            ESP_LOGD("petkit", "Unhandled cmd %d", cmd);
+        }
+      }
+      return NAN;
+  # --- fountain: exposed entities ---
+  - platform: template
+    id: fountain_voltage
+    name: "Fountain Voltage"
+    unit_of_measurement: "V"
+    device_class: voltage
+    state_class: measurement
+    accuracy_decimals: 3
+    update_interval: never
+    web_server:
+      sorting_group_id: sg_fountain
+      sorting_weight: 80
+  - platform: template
+    id: fountain_filter
+    name: "Fountain Filter used"
+    unit_of_measurement: "%"
+    icon: mdi:air-filter
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: never
+    web_server:
+      sorting_group_id: sg_fountain
+      sorting_weight: 65
+
+button:
+  - name: "Dispense food"
+    id: dispense_food
+    icon: mdi:food-turkey
+    platform: template
+    on_press:
+      - lambda: id(actuate_feeder)->execute((int) id(default_scoops).state);
+    web_server:
+      sorting_group_id: sg_feeding
+      sorting_weight: 10
+  - platform: template
+    name: "Apply schedule"
+    id: apply_schedule_btn
+    icon: mdi:calendar-check
+    on_press:
+      - script.execute: validate_schedule
+    web_server:
+      sorting_group_id: sg_feeding
+      sorting_weight: 25
+  - platform: template
+    name: "Reset desiccant"
+    id: reset_desiccant_btn
+    icon: mdi:water-percent
+    on_press:
+      - lambda: |-
+          auto t = id(sntp_time).now();
+          if (!t.is_valid()) {
+            ESP_LOGW("desiccant", "Cannot reset desiccant counter: time not synced yet");
+            return;
+          }
+          id(desiccant_last_reset) = t.timestamp;
+          id(feeder_desiccant_warn).publish_state(false);
+          id(desiccant_days_left).publish_state(${desiccant_interval_days});
+          ESP_LOGI("desiccant", "Desiccant counter reset, next replacement in ${desiccant_interval_days} days");
+    web_server:
+      sorting_group_id: sg_feeding
+      sorting_weight: 45
+  - platform: template
+    name: "Sync time now"
+    id: sync_time_btn
+    icon: mdi:clock-sync-outline
+    on_press:
+      - lambda: |-
+          ESP_LOGI("time", "Manual NTP sync requested");
+          id(sntp_time).update();
+    web_server:
+      sorting_group_id: sg_settings
+      sorting_weight: 18
+  - platform: template
+    name: "Fountain Reset Filter"
+    id: fountain_reset_filter_btn
+    icon: mdi:air-filter
+    on_press:
+      - if:
+          condition:
+            lambda: 'return id(pk_connected) && id(pk_ready);'
+          then:
+            - lambda: 'ESP_LOGI("petkit", "Sending filter reset (cmd 222) to fountain");'
+            - script.execute: pk_send_222
+          else:
+            - lambda: 'ESP_LOGW("petkit", "Cannot reset filter: fountain not connected/ready");'
+    web_server:
+      sorting_group_id: sg_fountain
+      sorting_weight: 85
+  - platform: template
+    name: "Fountain Refresh Data"
+    on_press:
+      - script.execute: pk_poll
+    web_server:
+      sorting_group_id: sg_fountain
+      sorting_weight: 90
+  - platform: restart
+    name: "Restart"
+    disabled_by_default: true
+    web_server:
+      sorting_group_id: sg_diag
+      sorting_weight: 90

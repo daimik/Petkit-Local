@@ -1,0 +1,134 @@
+# =============================================================================
+# Ready-made Home Assistant automations for Petkit-Local
+# =============================================================================
+# Copy the blocks you want into your automations.yaml (or paste into the
+# UI automation editor in YAML mode), then adjust two things:
+#
+#   1. ENTITY IDS — they depend on your device/area name. If your feeder is
+#      assigned to an area, HA may prefix entities (e.g.
+#      binary_sensor.living_room_petkit_fresh_element_solo_...).
+#      Check the exact IDs in Developer Tools -> States and adjust.
+#
+#   2. NOTIFY TARGETS — replace notify.notify with your own service(s),
+#      e.g. notify.mobile_app_your_phone, notify.gotify, or a notify group.
+# =============================================================================
+
+- id: cat_fountain_water_low
+  alias: 1. Water in Cat Fountain Low
+  description: Notify when the fountain water is low
+  triggers:
+  - trigger: state
+    entity_id: binary_sensor.petkit_fresh_element_solo_fountain_water_missing
+    from: 'off'
+    to: 'on'
+    for: 00:02:00
+  conditions:
+  - condition: state
+    entity_id: binary_sensor.petkit_fresh_element_solo_fountain_online
+    state: 'on'
+  actions:
+  - action: notify.notify
+    data:
+      title: 💧 Cat Fountain
+      message: Water level is low — please refill the fountain.
+  mode: single
+
+- id: cat_fountain_filter_due
+  alias: 2. Cat Fountain Filter Due
+  description: Early warning at 95% used + fountain's own filter alarm
+  triggers:
+  - trigger: numeric_state
+    entity_id: sensor.petkit_fresh_element_solo_fountain_filter_used
+    above: 94
+    id: early
+  - trigger: state
+    entity_id: binary_sensor.petkit_fresh_element_solo_fountain_filter_warning
+    from: 'off'
+    to: 'on'
+    id: alarm
+  conditions:
+  - condition: state
+    entity_id: binary_sensor.petkit_fresh_element_solo_fountain_online
+    state: 'on'
+  actions:
+  - variables:
+      pct: "{{ states('sensor.petkit_fresh_element_solo_fountain_filter_used') }}"
+      msg: >-
+        {% if trigger.id == 'early' %}
+        The fountain filter is {{ pct }}% used — order or prepare a new one soon.
+        {% else %}
+        The fountain filter is worn out ({{ pct }}% used). Rinse the new filter, install it, then press "Fountain Reset Filter" in Home Assistant.
+        {% endif %}
+  - action: notify.notify
+    data:
+      title: 🚰 Cat Fountain — filter
+      message: '{{ msg }}'
+  mode: single
+
+- id: cat_feeder_desiccant_due
+  alias: 3. Cat Feeder Desiccant Due
+  description: Notify when the feeder desiccant is 30 days old
+  triggers:
+  - trigger: state
+    entity_id: binary_sensor.petkit_fresh_element_solo_feeder_desiccant_warning
+    from: 'off'
+    to: 'on'
+  actions:
+  - action: notify.notify
+    data:
+      title: 🧂 Cat Feeder — desiccant
+      message: The desiccant is 30 days old. Swap the bag under the hopper lid, then press "Reset desiccant" in Home Assistant.
+  mode: single
+
+- id: cat_feeder_food_low
+  alias: 4. Cat Feeder Food Low
+  description: Notify when the feeder hopper is running low
+  triggers:
+  - trigger: state
+    entity_id: sensor.petkit_fresh_element_solo_feeder_status
+    to: Food level is low
+  actions:
+  - variables:
+      msg: >-
+        The cat feeder is running low on food — last feeding dispensed only
+        {{ states('sensor.petkit_fresh_element_solo_dispensed_food_quantity') }} pellets.
+        Refill the hopper.
+  - action: notify.notify
+    data:
+      title: 🍽️ Cat Feeder — food low
+      message: '{{ msg }}'
+  mode: single
+
+- id: cat_feeder_food_dispensed
+  alias: 5. Cat Feeder Food Dispensed
+  description: Notify when the feeder dispensed food (with humor scaled to portion size)
+  triggers:
+  - trigger: state
+    entity_id: sensor.petkit_fresh_element_solo_last_feeding
+  conditions:
+  - condition: template
+    value_template: >-
+      {{ trigger.to_state.state not in ['unknown', 'unavailable']
+         and trigger.from_state.state not in ['unknown', 'unavailable'] }}
+  actions:
+  - variables:
+      servings: "{{ (trigger.to_state.state | regex_findall('\\d+') | first | default(1)) | int }}"
+      msg: >-
+        {% if servings == 1 %}
+        😋 1 serving dispensed — a little snack, the cats are politely nibbling.
+        {% elif servings == 2 %}
+        😻 2 servings dispensed — proper dinner is served, crunching intensifies!
+        {% elif servings == 3 %}
+        😴 3 servings dispensed — feast mode! The cats are entering a food coma...
+        {% elif servings == 4 %}
+        🐱🐱 4 servings dispensed — Sunday buffet! Nobody moves from the bowl for the next hour.
+        {% elif servings == 5 %}
+        🌕 5 servings dispensed — the cat bellies are about to reach planetary scale.
+        {% else %}
+        🎪 {{ servings }} servings dispensed — that's not feeding anymore, that's a food festival. Roll them to their beds.
+        {% endif %}
+  - action: notify.notify
+    data:
+      title: 🍽️ Cat Feeder
+      message: '{{ msg }}'
+  mode: single
